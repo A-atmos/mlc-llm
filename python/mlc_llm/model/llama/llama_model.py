@@ -215,7 +215,7 @@ class LlamaModel(nn.Module):
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
+        # self.norm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
         self.num_layers_per_stage = (
             config.num_hidden_layers + config.pipeline_parallel_stages - 1
         ) // config.pipeline_parallel_stages
@@ -234,7 +234,7 @@ class LlamaModel(nn.Module):
             if layer_id != 0 and layer_id in self.layer_partition:
                 hidden_states = op_ext.pipeline_stage_boundary(hidden_states)
             hidden_states = layer(hidden_states, paged_kv_cache, layer_id)
-        hidden_states = self.norm(hidden_states)
+        # hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
@@ -263,8 +263,8 @@ class LlamaForCausalLM(nn.Module):  # pylint: disable=too-many-instance-attribut
                 for _, param in self.model.layers[layer_id].named_parameters():
                     param.attrs["pipeline_stages"] = [stage]
             # last stage
-            last_stage = config.pipeline_parallel_stages - 1
-            self.model.norm.weight.attrs["pipeline_stages"] = [last_stage]
+            # last_stage = config.pipeline_parallel_stages - 1
+            # self.model.norm.weight.attrs["pipeline_stages"] = [last_stage]
             # embedding table and lm_head is required by all stages
             all_stages = list(range(config.pipeline_parallel_stages))
             self.model.embed_tokens.weight.attrs["pipeline_stages"] = all_stages
