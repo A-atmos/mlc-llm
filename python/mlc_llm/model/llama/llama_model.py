@@ -158,9 +158,9 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.emb_dim, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads_q * self.head_dim, self.emb_dim, bias=False)
 
-    def forward(self, hidden_states, position_ids=None):
+    def forward(self, hidden_states, paged_kv_cache: PagedKVCache, layer_id: int):
         batch_size, seq_len, _ = hidden_states.shape
-        
+        position_ids=None
         # Project inputs to queries, keys, and values
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
