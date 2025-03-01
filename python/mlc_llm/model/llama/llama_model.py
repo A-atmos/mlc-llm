@@ -138,36 +138,96 @@ class LlamaEmbedding(nn.Embedding):
         return nn.op.matmul(x, weight, out_dtype="float32")
 
 
-class LlamaAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
-    def __init__(self, config: LlamaConfig):
+class LlamaAttention(nn.Module):
+    """Multi-head attention for Llama3 architecture (without KV cache)."""
+    
+    def __init__(self, config):
+        super().__init__()
+        
+        # Extract attention parameters from config
+        self.n_kv_heads = config.num_key_value_heads
+        self.n_heads_q = config.num_attention_heads
+        self.n_rep = self.n_heads_q // self.n_kv_heads
         self.head_dim = config.head_dim
-        self.num_q_heads = config.num_attention_heads // config.tensor_parallel_shards
-        assert (
-            config.num_key_value_heads % config.tensor_parallel_shards == 0
-        ), f"num_kv_heads({config.num_key_value_heads}) must be divisible by tensor_parallel_shards"
-        assert (
-            config.num_key_value_heads >= config.tensor_parallel_shards
-        ), f"Too large tensor_parallel_shards, must be smaller than {config.num_key_value_heads}"
-        self.num_kv_heads = config.num_key_value_heads // config.tensor_parallel_shards
-        self.qkv_proj = nn.Linear(
-            in_features=config.hidden_size,
-            out_features=(self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim,
-            bias=False,
-        )
-        self.o_proj = nn.Linear(self.num_q_heads * self.head_dim, config.hidden_size, bias=False)
+        self.emb_dim = config.hidden_size
+        self.rope_theta = config.rope_theta
+        
+        # Create projection layers
+        self.q_proj = nn.Linear(self.emb_dim, self.emb_dim, bias=False)
+        self.k_proj = nn.Linear(self.emb_dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.emb_dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads_q * self.head_dim, self.emb_dim, bias=False)
 
-    def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
-        d, h_q, h_kv = self.head_dim, self.num_q_heads, self.num_kv_heads
-        b, s, _ = hidden_states.shape
-        # QKV Projection
-        qkv = self.qkv_proj(hidden_states)
-        qkv = op.reshape(qkv, (b, s, h_q + h_kv + h_kv, d))
-        # Attention
-        output = op.reshape(
-            paged_kv_cache.attention_with_fused_qkv(layer_id, qkv, self.num_q_heads),
-            (b, s, h_q * d),
+    def forward(self, hidden_states, position_ids=None):
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        # Project inputs to queries, keys, and values
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        
+        # Reshape to separate heads
+        q = op.reshape(q, (batch_size, seq_len, self.n_heads_q, self.head_dim))
+        k = op.reshape(k, (batch_size, seq_len, self.n_kv_heads, self.head_dim))
+        v = op.reshape(v, (batch_size, seq_len, self.n_kv_heads, self.head_dim))
+        
+        # Apply rotary positional embeddings
+        if position_ids is None:
+            # Create position ids if not provided
+            position_ids = op.arange(0, seq_len, dtype="int32")
+            position_ids = op.broadcast_to(position_ids, (batch_size, seq_len))
+        
+        # Apply RoPE using MLC LLM's built-in function
+        q, k = op_ext.apply_rotary_emb(
+            q, k, position_ids, theta=self.rope_theta, 
+            mode=RopeMode.NORMAL
         )
-        return self.o_proj(output)
+        
+        # Repeat KV heads to match query heads (group query attention)
+        if self.n_kv_heads < self.n_heads_q:
+            k = op.repeat_interleave(k, self.n_rep, axis=2)
+            v = op.repeat_interleave(v, self.n_rep, axis=2)
+        
+        # Rearrange dimensions for attention computation
+        # (batch_size, seq_len, num_heads, head_dim) -> (batch_size, num_heads, seq_len, head_dim)
+        q = op.transpose(q, axes=(0, 2, 1, 3))
+        k = op.transpose(k, axes=(0, 2, 1, 3))
+        v = op.transpose(v, axes=(0, 2, 1, 3))
+        
+        # Compute attention scores
+        # (batch_size, num_heads, seq_len, seq_len)
+        scale = op.sqrt(op.astype(self.head_dim, "float32"))
+        attn_scores = op.matmul(q, op.transpose(k, axes=(0, 1, 3, 2))) / scale
+        
+        # Create causal mask
+        # Create a lower triangular mask of shape (seq_len, seq_len)
+        mask = op.triu(
+            op.full((seq_len, seq_len), -float("inf"), dtype="float32"), 
+            k=1
+        )
+        # Broadcast mask to match attention scores shape
+        mask = op.broadcast_to(mask, (batch_size, self.n_heads_q, seq_len, seq_len))
+        
+        # Apply causal mask
+        attn_scores = attn_scores + mask
+        
+        # Apply softmax to get attention weights
+        attn_weights = op.softmax(attn_scores, axis=-1)
+        
+        # Apply attention weights to values
+        context_vec = op.matmul(attn_weights, v)
+        
+        # Rearrange dimensions back
+        # (batch_size, num_heads, seq_len, head_dim) -> (batch_size, seq_len, num_heads, head_dim)
+        context_vec = op.transpose(context_vec, axes=(0, 2, 1, 3))
+        
+        # Reshape to combine heads
+        context_vec = op.reshape(context_vec, (batch_size, seq_len, self.n_heads_q * self.head_dim))
+        
+        # Final projection
+        output = self.o_proj(context_vec)
+        
+        return output
 
 
 class LlamaDecoderLayer(nn.Module):
