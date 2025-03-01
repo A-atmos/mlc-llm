@@ -63,6 +63,7 @@ class Llama3Attention(nn.Module):
         self.head_dim = config.head_dim
         self.tp_mode = tp_mode
         self.rope_mode = RopeMode.NORMAL
+        self.config = config
         
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
@@ -94,7 +95,7 @@ class Llama3Attention(nn.Module):
                 query_states,
                 key_states,
                 position_ids,
-                theta=self.config.rope_theta,
+                theta= self.config.rope_theta,
                 scaling_factor=self.config.rope_scaling["factor"] if self.config.rope_scaling else None,
                 mode=self.rope_mode,
             )
